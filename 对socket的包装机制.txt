@@ -1,0 +1,218 @@
+最终包装成了channel、 channel内部在解析时使用了TcpPipeChannel：
+
+serverd的包装
+
+1.TcpChannelCreatorFactory
+--CreateChannelCreator
+return new TcpChannelCreator(options, channelFactory, channelFactoryLogger);
+
+2. public class TcpChannelCreator : IChannelCreator
+    {
+        private Socket _listenSocket;
+        
+          public bool Start()
+        {
+   var listenSocket = _listenSocket = new Socket(listenEndpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                     listenSocket.Bind(listenEndpoint);
+                listenSocket.Listen(options.BackLog);
+                KeepAccept(listenSocket).DoNotAwait();
+                
+                }
+                
+                  public async Task<IChannel> CreateChannel(object connection)
+        {
+            return await _channelFactory((Socket)connection);
+        }
+                
+3. class SuperSocketService<TReceivePackageInfo> : IHostedService, IServer, IChannelRegister, ILoggerAccessor, ISessionEventHost
+
+
+        async Task IChannelRegister.RegisterChannel(object connection)
+        {
+            var channel = await _channelCreators.FirstOrDefault().CreateChannel(connection);
+            await AcceptNewChannel(channel);
+        }
+
+4.c class SuperSocketExtensions
+    {
+        public static async ValueTask<bool> ActiveConnect(this IServer server, EndPoint remoteEndpoint)
+        {
+            var socket = new Socket(remoteEndpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+
+            try
+            {
+                await socket.ConnectAsync(remoteEndpoint);
+                await (server as IChannelRegister).RegisterChannel(socket);
+                return true;
+            }
+            
+
+------------------------------------------client的包装
+1.class SocketConnector : ConnectorBase
+
+ protected override async ValueTask<ConnectState> ConnectAsync(EndPoint remoteEndPoint, ConnectState state, CancellationToken cancellationToken)
+        {
+            var socket = new Socket(remoteEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+
+            try
+            {
+                var localEndPoint = LocalEndPoint;
+
+                if (localEndPoint != null)
+                {
+                    socket.ExclusiveAddressUse = false;
+                    socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, 1);
+                    socket.Bind(localEndPoint);
+
+————————————————————————————————————————————————————pipeline解析-----ReadOnlyMemory、-ReadOnlySequence、-----------------------------------------
+
+1. class TcpPipeChannel<TPackageInfo> : PipeChannel<TPackageInfo>
+    {
+
+        private Socket _socket;
+
+        private List<ArraySegment<byte>> _segmentsForSend;
+        
+
+        private async ValueTask<int> ReceiveAsync(Socket socket, Memory<byte> memory, SocketFlags socketFlags, CancellationToken cancellationToken)
+        {
+            return await socket
+                .ReceiveAsync(GetArrayByMemory((ReadOnlyMemory<byte>)memory), socketFlags, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        protected override async ValueTask<int> SendOverIOAsync(ReadOnlySequence<byte> buffer, CancellationToken cancellationToken)
+        {
+            if (buffer.IsSingleSegment)
+            {
+                return await _socket
+                    .SendAsync(GetArrayByMemory(buffer.First), SocketFlags.None, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            
+            if (_segmentsForSend == null)
+            {
+                _segmentsForSend = new List<ArraySegment<byte>>();
+            }
+            else
+            {
+                _segmentsForSend.Clear();
+            }
+
+            var segments = _segmentsForSend;
+
+            foreach (var piece in buffer)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _segmentsForSend.Add(GetArrayByMemory(piece));
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            
+            return await _socket
+                .SendAsync(_segmentsForSend, SocketFlags.None)
+                .ConfigureAwait(false);
+        }
+
+     
+    }
+}
+
+
+
+——————————————————————————————————————————————————过滤——————————————————————————————————————————————————————————————
+
+1.public abstract class PipelineFilterBase<TPackageInfo> : IPipelineFilter<TPackageInfo>
+        where TPackageInfo : class
+    {
+        public IPipelineFilter<TPackageInfo> NextFilter { get; protected set; }
+
+        public abstract TPackageInfo Filter(ref SequenceReader<byte>  reader);
+        
+2.具体使用 PipeChannel----当channel 在读取数据时、触发
+
+
+   protected async Task ReadPipeAsync(PipeReader reader)
+        {
+        
+
+            while (!cts.IsCancellationRequested)
+            {
+                 
+                    result = await reader.ReadAsync(cts.Token).ConfigureAwait(false);
+              
+ 
+                 if (buffer.Length > 0)
+                    {
+                        if (!ReaderBuffer(ref buffer, out consumed, out examined))//----------------------------------------------------不停的读取。
+                        {
+                            completed = true;
+                            break;
+                        }                        
+                    } 
+            } 
+        }
+
+
+
+//读取结果，处理
+ private bool ReaderBuffer(ref ReadOnlySequence<byte> buffer, out SequencePosition consumed, out SequencePosition examined)
+        {
+            consumed = buffer.Start;
+            examined = buffer.End;
+ 
+            var seqReader = new SequenceReader<byte>(buffer);
+
+            while (true)
+            {
+                 
+
+                var packageInfo = currentPipelineFilter.Filter(ref seqReader);//-----------------------------------filter处理
+
+                var nextFilter = currentPipelineFilter.NextFilter;
+
+                if (nextFilter != null)
+                {
+                    nextFilter.Context = currentPipelineFilter.Context; // pass through the context
+                    _pipelineFilter = nextFilter;
+                    filterSwitched = true;
+                }
+
+   _packagePipe.Write(packageInfo);//--------------将最终结果，写入
+   
+   
+   
+3.class DefaultObjectPipe<T>
+public int Write(T target)
+        {
+            lock (_syncRoot)
+            {
+                if (_waiting)
+                {
+                    _waiting = false;
+                    _taskSourceCore.SetResult(target);                    
+                    return _length;
+                }
+
+                var current = _current;
+
+                if (!current.IsAvailable)
+                {
+                    current = CreateSegment();
+                    SetBufferSegment(current);
+                }
+
+                current.Write(target);
+                _length++;
+                return _length;
+            }            
+        }
+
+//read的时候，执行OnWaitTaskStart
+
+   protected override void OnWaitTaskStart()
+        {
+            SetTaskCompleted(true);
+        }
+        
+————————————————————————————————————————具体怎么找到command的。 可以断点调试再补充——————————————————————————————————————
